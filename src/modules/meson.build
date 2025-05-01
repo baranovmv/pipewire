@@ -698,7 +698,8 @@ if build_module_roc
   )
 
   pipewire_module_roc_source = shared_library('pipewire-module-roc-source',
-    [ 'module-roc-source.c' ],
+    [ 'module-roc-source.c',
+      'module-roc/common.c'],
     include_directories : [configinc],
     install : true,
     install_dir : modules_install_dir,

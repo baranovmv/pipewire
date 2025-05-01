@@ -53,6 +53,9 @@
  * - `roc.latency-tuner.profile = <str>`: Possible values: `default`, `intact`,
  *       `responsive`, `gradual`
  * - `fec.code = <str>`: Possible values: `default`, `disable`, `rs8m`, `ldpc`
+ * - `log.level = <str>`: log level for roc-toolkit. Possible values: `DEFAULT`, 
+ *       `NONE`, `ERROR`, `INFO`, `DEBUG`, `TRACE`; `DEFAULT` follows the log level 
+ *       of the PipeWire context.
  *
  * - `resampler.profile = <str>`: Deprecated, use roc.resampler.profile
  *
@@ -85,6 +88,7 @@
  *          source.props = {
  *             node.name = "roc-source"
  *          }
+ *          log.level = DEFAULT
  *      }
  *  }
  *]
@@ -94,7 +98,7 @@
 
 #define NAME "roc-source"
 
-PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+PW_LOG_TOPIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
 
 struct module_roc_source_data {
@@ -131,6 +135,8 @@ struct module_roc_source_data {
 
 	roc_endpoint *local_control_addr;
 	int local_control_port;
+
+	roc_log_level loglevel;
 };
 
 static void stream_destroy(void *d)
@@ -302,6 +308,9 @@ static int roc_source_setup(struct module_roc_source_data *data)
 	data->stride = info.channels * sizeof(float);
 
 	pw_properties_setf(data->playback_props, PW_KEY_NODE_RATE, "1/%d", info.rate);
+
+    roc_log_set_handler(pw_roc_log_handler, NULL);
+    roc_log_set_level(data->loglevel);
 
 	/*
 	 * Note that target latency is in nano seconds.
@@ -532,6 +541,17 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		}
 	} else {
 		data->fec_code = ROC_FEC_ENCODING_DEFAULT;
+	}
+    if ((str = pw_properties_get(props, "log.level")) != NULL) {
+		const struct spa_log *log_conf = pw_log_get();
+		roc_log_level default_level = ROC_LOG_ERROR;
+        if (log_conf) {
+        	default_level = pw_roc_log_level_pw_2_roc(log_conf->level);
+		}
+		if (pw_roc_parse_log_level(&data->loglevel, str, default_level)) {
+			pw_log_error("Invalid log level %s, using default", str);
+			data->loglevel = default_level;
+        }
 	}
 
 	data->core = pw_context_get_object(data->module_context, PW_TYPE_INTERFACE_Core);
