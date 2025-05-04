@@ -407,6 +407,7 @@ static const struct spa_dict_item module_roc_source_info[] = {
 				"( roc.latency-tuner.backend=<empty>|default|niq ) "
 				"( roc.latency-tuner.profile=<empty>|default|intact|responsive|gradual ) "
 				"( fec.code=<empty>|disable|rs8m|ldpc ) "
+				"( log.level=<empty>|DEFAULT|NONE|ERROR|INFO|DEBUG|TRACE ) "
 				"( sess.latency.msec=<target network latency in milliseconds> ) "
 				"( local.ip=<local receiver ip> ) "
 				"( local.source.port=<local receiver port for source packets> ) "
