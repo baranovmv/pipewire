@@ -7,6 +7,9 @@
 
 #include <spa/utils/string.h>
 #include <spa/support/log.h>
+#include <spa/param/audio/raw.h>
+
+struct pw_properties;
 
 #define PW_ROC_DEFAULT_IP "0.0.0.0"
 #define PW_ROC_DEFAULT_SOURCE_PORT 10001
@@ -16,7 +19,68 @@
 #define PW_ROC_DEFAULT_RATE 44100
 #define PW_ROC_DEFAULT_CONTROL_PROTO ROC_PROTO_RTCP
 
+#define DEFAULT_FORMAT "F32"
+#define DEFAULT_POSITION "[ FL FR ]"
+
+#define PW_ROC_CUSTOM_ENCODING_ID 100
+
 void pw_roc_log_handler(const roc_log_message* message, void* argument);
+void pw_roc_parse_audio_info(const struct pw_properties *props, struct spa_audio_info_raw *info);
+
+/** Map SPA audio format to roc_subformat. Returns -1 for unsupported formats. */
+static inline int pw_roc_spa_format_to_roc(enum spa_audio_format fmt, roc_subformat *out)
+{
+	switch (fmt) {
+	case SPA_AUDIO_FORMAT_S16:
+		*out = ROC_SUBFORMAT_PCM_SINT16;
+		return 0;
+	case SPA_AUDIO_FORMAT_S24:
+		*out = ROC_SUBFORMAT_PCM_SINT24;
+		return 0;
+	case SPA_AUDIO_FORMAT_S32:
+		*out = ROC_SUBFORMAT_PCM_SINT32;
+		return 0;
+	case SPA_AUDIO_FORMAT_F32:
+		*out = ROC_SUBFORMAT_PCM_FLOAT32;
+		return 0;
+	case SPA_AUDIO_FORMAT_F64:
+		*out = ROC_SUBFORMAT_PCM_FLOAT64;
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+/** Return byte size per sample for the given SPA audio format. Returns 0 for unsupported. */
+static inline uint32_t pw_roc_spa_format_sample_size(enum spa_audio_format fmt)
+{
+	switch (fmt) {
+	case SPA_AUDIO_FORMAT_S16:
+		return 2;
+	case SPA_AUDIO_FORMAT_S24:
+		return 3;
+	case SPA_AUDIO_FORMAT_S32:
+	case SPA_AUDIO_FORMAT_F32:
+		return 4;
+	case SPA_AUDIO_FORMAT_F64:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+/** Map channel count to roc_channel_layout. */
+static inline roc_channel_layout pw_roc_channels_to_layout(uint32_t channels)
+{
+	switch (channels) {
+	case 1:
+		return ROC_CHANNEL_LAYOUT_MONO;
+	case 2:
+		return ROC_CHANNEL_LAYOUT_STEREO;
+	default:
+		return ROC_CHANNEL_LAYOUT_MULTITRACK;
+	}
+}
 
 static inline int pw_roc_parse_fec_encoding(roc_fec_encoding *out, const char *str)
 {
@@ -132,10 +196,10 @@ static inline void pw_roc_fec_encoding_to_proto(roc_fec_encoding fec_code, roc_p
 	}
 }
 
-static inline roc_log_level pw_roc_log_level_pw_2_roc (const enum spa_log_level pw_log_level)
+static inline roc_log_level pw_roc_log_level_pw_2_roc(const enum spa_log_level pw_log_level)
 {
 	if (pw_log_level == SPA_LOG_LEVEL_NONE)
-      return ROC_LOG_NONE;
+		return ROC_LOG_NONE;
 	else if (pw_log_level == SPA_LOG_LEVEL_ERROR)
 		return ROC_LOG_ERROR;
 	else if (pw_log_level == SPA_LOG_LEVEL_WARN)
@@ -146,41 +210,42 @@ static inline roc_log_level pw_roc_log_level_pw_2_roc (const enum spa_log_level 
 		return ROC_LOG_DEBUG;
 	else if (pw_log_level == SPA_LOG_LEVEL_TRACE)
 		return ROC_LOG_TRACE;
-    else
-    	return ROC_LOG_NONE;
+	else
+		return ROC_LOG_NONE;
 }
 
-static inline enum spa_log_level pw_roc_log_level_roc_2_pw (const roc_log_level roc_log_level)
+static inline enum spa_log_level pw_roc_log_level_roc_2_pw(const roc_log_level roc_log_level)
 {
-  if (roc_log_level == ROC_LOG_NONE)
-    return SPA_LOG_LEVEL_NONE;
-  else if (roc_log_level == ROC_LOG_ERROR)
-    return SPA_LOG_LEVEL_ERROR;
-  else if (roc_log_level == ROC_LOG_INFO)
-    return SPA_LOG_LEVEL_INFO;
-  else if (roc_log_level == ROC_LOG_DEBUG)
-    return SPA_LOG_LEVEL_DEBUG;
-  else if (roc_log_level == ROC_LOG_TRACE)
-    return SPA_LOG_LEVEL_TRACE;
-  else
-    return SPA_LOG_LEVEL_NONE;
+	if (roc_log_level == ROC_LOG_NONE)
+		return SPA_LOG_LEVEL_NONE;
+	else if (roc_log_level == ROC_LOG_ERROR)
+		return SPA_LOG_LEVEL_ERROR;
+	else if (roc_log_level == ROC_LOG_INFO)
+		return SPA_LOG_LEVEL_INFO;
+	else if (roc_log_level == ROC_LOG_DEBUG)
+		return SPA_LOG_LEVEL_DEBUG;
+	else if (roc_log_level == ROC_LOG_TRACE)
+		return SPA_LOG_LEVEL_TRACE;
+	else
+		return SPA_LOG_LEVEL_NONE;
 }
+
 static inline int pw_roc_parse_log_level(roc_log_level *loglevel, const char *str,
                                          roc_log_level default_level)
 {
-  	if (spa_streq(str, "DEFUALT"))
+	if (spa_streq(str, "DEFAULT"))
 		*loglevel = default_level;
 	else if (spa_streq(str, "NONE"))
-        *loglevel = ROC_LOG_NONE;
+		*loglevel = ROC_LOG_NONE;
 	else if (spa_streq(str, "ERROR"))
-        *loglevel = ROC_LOG_ERROR;
+		*loglevel = ROC_LOG_ERROR;
 	else if (spa_streq(str, "INFO"))
 		*loglevel = ROC_LOG_INFO;
 	else if (spa_streq(str, "DEBUG"))
 		*loglevel = ROC_LOG_DEBUG;
 	else if (spa_streq(str, "TRACE"))
 		*loglevel = ROC_LOG_TRACE;
-    else
+	else
 		return -EINVAL;
 	return 0;
 }

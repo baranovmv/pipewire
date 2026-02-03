@@ -45,6 +45,17 @@
  * - `remote.repair.port = <str>`: remote receiver TCP/UDP port for receiver packets
  * - `remote.control.port = <str>`: remote receiver TCP/UDP port for control packets
  * - `fec.code = <str>`: Possible values: `disable`, `rs8m`, `ldpc`
+ * - `roc.resampler.backend = <str>`: Possible values: `default`, `builtin`,
+ *       `speex`, `speexdec`.
+ * - `roc.resampler.profile = <str>`: Possible values: `default`, `high`,
+ *       `medium`, `low`.
+ * - `roc.latency-tuner.backend = <str>`: Possible values: `default`, `niq`
+ * - `roc.latency-tuner.profile = <str>`: Possible values: `default`, `intact`,
+ *       `responsive`, `gradual`
+ * - `roc.packet.length.msec = <str>`: packet duration in milliseconds
+ * - `log.level = <str>`: log level for roc-toolkit. Possible values: `DEFAULT`,
+ *       `NONE`, `ERROR`, `INFO`, `DEBUG`, `TRACE`; `DEFAULT` follows the log level
+ *       of the PipeWire context.
  *
  * ## General options
  *
@@ -66,10 +77,20 @@
  *          remote.source.port = 10001
  *          remote.repair.port = 10002
  *          remote.control.port = 10003
+ *          #roc.resampler.backend = default
+ *          #roc.resampler.profile = default
+ *          #roc.latency-tuner.backend = default
+ *          #roc.latency-tuner.profile = default
+ *          #roc.packet.length.msec = 0
  *          sink.name = "ROC Sink"
  *          sink.props = {
  *             node.name = "roc-sink"
+ *             #audio.format=<sample format, e.g. F32, S16>
+ *             #audio.rate=<sample rate>
+ *             #audio.channels=<number of channels>
+ *             #audio.position=<channel map>
  *          }
+ *          #log.level = DEFAULT
  *      }
  *  }
  *]
@@ -79,7 +100,7 @@
 
 #define NAME "roc-sink"
 
-PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+PW_LOG_TOPIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
 
 struct module_roc_sink_data {
@@ -103,13 +124,20 @@ struct module_roc_sink_data {
 	roc_sender *sender;
 
 	roc_fec_encoding fec_code;
+	roc_resampler_profile resampler_profile;
+	roc_resampler_backend resampler_backend;
+	roc_latency_tuner_backend latency_tuner_backend;
+	roc_latency_tuner_profile latency_tuner_profile;
 	uint32_t rate;
+	uint32_t packet_length_msec;
 	char *remote_ip;
 	int remote_source_port;
 	int remote_repair_port;
 
 	roc_endpoint *remote_control_addr;
 	int remote_control_port;
+
+	roc_log_level loglevel;
 };
 
 static void stream_destroy(void *d)
@@ -245,6 +273,7 @@ static int roc_sink_setup(struct module_roc_sink_data *data)
 {
 	roc_context_config context_config;
 	roc_sender_config sender_config;
+	roc_subformat subformat;
 	struct spa_audio_info_raw info = { 0 };
 	const struct spa_pod *params[1];
 	struct spa_pod_builder b;
@@ -253,7 +282,19 @@ static int roc_sink_setup(struct module_roc_sink_data *data)
 	int res;
 	roc_protocol audio_proto, repair_proto;
 
-	memset(&context_config, 0, sizeof(context_config));
+	pw_roc_parse_audio_info(data->capture_props, &info);
+	if (info.rate == 0)
+		info.rate = data->rate;
+
+	if (pw_roc_spa_format_to_roc(info.format, &subformat) < 0) {
+		pw_log_error("unsupported audio format: %d", info.format);
+		return -EINVAL;
+	}
+
+	pw_log_info("sender encoding: format=%d subformat=%d rate=%u channels=%u",
+			info.format, subformat, info.rate, info.channels);
+
+	spa_zero(context_config);
 
 	res = roc_context_open(&context_config, &data->context);
 	if (res) {
@@ -261,21 +302,46 @@ static int roc_sink_setup(struct module_roc_sink_data *data)
 		return -EINVAL;
 	}
 
+	roc_log_set_handler(pw_roc_log_handler, NULL);
+	roc_log_set_level(data->loglevel);
+
+	/* Register custom packet encoding matching the frame encoding */
+	{
+		roc_media_encoding packet_enc;
+		spa_zero(packet_enc);
+		packet_enc.format = ROC_FORMAT_PCM;
+		packet_enc.subformat = subformat;
+		packet_enc.rate = info.rate;
+		packet_enc.channels = pw_roc_channels_to_layout(info.channels);
+		if (info.channels > 2)
+			packet_enc.tracks = info.channels;
+
+		res = roc_context_register_encoding(data->context, PW_ROC_CUSTOM_ENCODING_ID, &packet_enc);
+		if (res) {
+			pw_log_error("failed to register custom packet encoding: %d", res);
+			return -EINVAL;
+		}
+		pw_log_info("registered custom packet encoding id=%d", PW_ROC_CUSTOM_ENCODING_ID);
+	}
+
 	spa_zero(sender_config);
 
-	sender_config.frame_encoding.rate = data->rate;
-	sender_config.frame_encoding.channels = ROC_CHANNEL_LAYOUT_STEREO;
-	sender_config.frame_encoding.format = ROC_FORMAT_PCM_FLOAT32;
-	sender_config.packet_encoding = ROC_PACKET_ENCODING_AVP_L16_STEREO;
+	sender_config.frame_encoding.format = ROC_FORMAT_PCM;
+	sender_config.frame_encoding.subformat = subformat;
+	sender_config.frame_encoding.rate = info.rate;
+	sender_config.frame_encoding.channels = pw_roc_channels_to_layout(info.channels);
+	if (info.channels > 2)
+		sender_config.frame_encoding.tracks = info.channels;
+
+	sender_config.packet_encoding = PW_ROC_CUSTOM_ENCODING_ID;
 	sender_config.fec_encoding = data->fec_code;
+	sender_config.resampler_profile = data->resampler_profile;
+	sender_config.resampler_backend = data->resampler_backend;
+	sender_config.latency_tuner_backend = data->latency_tuner_backend;
+	sender_config.latency_tuner_profile = data->latency_tuner_profile;
 
-	info.rate = data->rate;
-
-	/* Fixed to be the same as ROC sender config above */
-	info.channels = 2;
-	info.format = SPA_AUDIO_FORMAT_F32;
-	info.position[0] = SPA_AUDIO_CHANNEL_FL;
-	info.position[1] = SPA_AUDIO_CHANNEL_FR;
+	if (data->packet_length_msec > 0)
+		sender_config.packet_length = (unsigned long long)data->packet_length_msec * SPA_NSEC_PER_MSEC;
 
 	pw_properties_setf(data->capture_props, PW_KEY_NODE_RATE, "1/%d", info.rate);
 
@@ -356,6 +422,12 @@ static const struct spa_dict_item module_roc_sink_info[] = {
 	{ PW_KEY_MODULE_DESCRIPTION, "roc sink" },
 	{ PW_KEY_MODULE_USAGE,	"( sink.name=<name for the sink> ) "
 				"( fec.code=<empty>|disable|rs8m|ldpc ) "
+				"( roc.resampler.backend=<empty>|default|builtin|speex|speexdec ) "
+				"( roc.resampler.profile=<empty>|default|high|medium|low ) "
+				"( roc.latency-tuner.backend=<empty>|default|niq ) "
+				"( roc.latency-tuner.profile=<empty>|default|intact|responsive|gradual ) "
+				"( roc.packet.length.msec=<packet duration in milliseconds> ) "
+				"( log.level=<empty>|DEFAULT|NONE|ERROR|INFO|DEBUG|TRACE ) "
 				"remote.ip=<remote receiver ip> "
 				"( remote.source.port=<remote receiver port for source packets> ) "
 				"( remote.repair.port=<remote receiver port for repair packets> ) "
@@ -453,11 +525,57 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			pw_log_error("Invalid fec code %s, using default", str);
 			data->fec_code = ROC_FEC_ENCODING_DEFAULT;
 		}
-		pw_log_info("using fec.code %s %d", str, data->fec_code);
 	} else {
 		data->fec_code = ROC_FEC_ENCODING_DEFAULT;
 	}
-
+	if ((str = pw_properties_get(props, "roc.resampler.backend")) != NULL) {
+		if (pw_roc_parse_resampler_backend(&data->resampler_backend, str)) {
+			pw_log_warn("Invalid resampler backend %s, using default", str);
+			data->resampler_backend = ROC_RESAMPLER_BACKEND_DEFAULT;
+		}
+	} else {
+		data->resampler_backend = ROC_RESAMPLER_BACKEND_DEFAULT;
+	}
+	if ((str = pw_properties_get(props, "roc.resampler.profile")) != NULL) {
+		if (pw_roc_parse_resampler_profile(&data->resampler_profile, str)) {
+			pw_log_warn("Invalid resampler profile %s, using default", str);
+			data->resampler_profile = ROC_RESAMPLER_PROFILE_DEFAULT;
+		}
+	} else {
+		data->resampler_profile = ROC_RESAMPLER_PROFILE_DEFAULT;
+	}
+	if ((str = pw_properties_get(props, "roc.latency-tuner.backend")) != NULL) {
+		if (pw_roc_parse_latency_tuner_backend(&data->latency_tuner_backend, str)) {
+			pw_log_warn("Invalid latency-tuner backend %s, using default", str);
+			data->latency_tuner_backend = ROC_LATENCY_TUNER_BACKEND_DEFAULT;
+		}
+	} else {
+		data->latency_tuner_backend = ROC_LATENCY_TUNER_BACKEND_DEFAULT;
+	}
+	if ((str = pw_properties_get(props, "roc.latency-tuner.profile")) != NULL) {
+		if (pw_roc_parse_latency_tuner_profile(&data->latency_tuner_profile, str)) {
+			pw_log_warn("Invalid latency-tuner profile %s, using default", str);
+			data->latency_tuner_profile = ROC_LATENCY_TUNER_PROFILE_DEFAULT;
+		}
+	} else {
+		data->latency_tuner_profile = ROC_LATENCY_TUNER_PROFILE_DEFAULT;
+	}
+	if ((str = pw_properties_get(props, "roc.packet.length.msec")) != NULL) {
+		data->packet_length_msec = pw_properties_parse_int(str);
+	} else {
+		data->packet_length_msec = 0;
+	}
+	if ((str = pw_properties_get(props, "log.level")) != NULL) {
+		const struct spa_log *log_conf = pw_log_get();
+		roc_log_level default_level = ROC_LOG_ERROR;
+		if (log_conf) {
+			default_level = pw_roc_log_level_pw_2_roc(log_conf->level);
+		}
+		if (pw_roc_parse_log_level(&data->loglevel, str, default_level)) {
+			pw_log_error("Invalid log level %s, using default", str);
+			data->loglevel = default_level;
+		}
+	}
 
 	data->core = pw_context_get_object(data->module_context, PW_TYPE_INTERFACE_Core);
 	if (data->core == NULL) {

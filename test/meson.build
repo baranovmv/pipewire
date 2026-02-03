@@ -144,6 +144,19 @@ if default_sm == 'media-session' or default_sm == 'wireplumber'
   )
 endif
 
+if roc_dep.found()
+  test('test-roc',
+      executable('test-roc',
+                 'test-roc.c',
+                 include_directories: [pwtest_inc, configinc],
+                 dependencies: [spa_dep, pipewire_dep, roc_dep, mathlib],
+                 link_with: [pwtest_lib,
+                              pipewire_module_roc_sink,
+                              pipewire_module_roc_source]),
+      timeout: 300,
+  )
+endif
+
 valgrind = find_program('valgrind', required: false)
 summary({'valgrind (test setup)': valgrind.found()}, bool_yn: true, section: 'Optional programs')
 if valgrind.found()

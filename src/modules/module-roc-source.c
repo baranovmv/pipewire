@@ -53,8 +53,8 @@
  * - `roc.latency-tuner.profile = <str>`: Possible values: `default`, `intact`,
  *       `responsive`, `gradual`
  * - `fec.code = <str>`: Possible values: `default`, `disable`, `rs8m`, `ldpc`
- * - `log.level = <str>`: log level for roc-toolkit. Possible values: `DEFAULT`, 
- *       `NONE`, `ERROR`, `INFO`, `DEBUG`, `TRACE`; `DEFAULT` follows the log level 
+ * - `log.level = <str>`: log level for roc-toolkit. Possible values: `DEFAULT`,
+ *       `NONE`, `ERROR`, `INFO`, `DEBUG`, `TRACE`; `DEFAULT` follows the log level
  *       of the PipeWire context.
  *
  * - `resampler.profile = <str>`: Deprecated, use roc.resampler.profile
@@ -87,8 +87,12 @@
  *          source.name = "ROC Source"
  *          source.props = {
  *             node.name = "roc-source"
+ *             #audio.format=<sample format, e.g. F32, S16>
+ *             #audio.rate=<sample rate>
+ *             #audio.channels=<number of channels>
+ *             #audio.position=<channel map>
  *          }
- *          log.level = DEFAULT
+ *         log.level = DEFAULT
  *      }
  *  }
  *]
@@ -269,17 +273,30 @@ static const struct pw_impl_module_events module_events = {
 	.destroy = module_destroy,
 };
 
-static int roc_source_setup(struct module_roc_source_data *data)
+static int roc_source_setup(struct module_roc_source_data *data, struct spa_audio_info_raw *audio_info)
 {
 	roc_context_config context_config;
 	roc_receiver_config receiver_config;
-	struct spa_audio_info_raw info = { 0 };
+	roc_subformat subformat;
+	uint32_t sample_size;
 	const struct spa_pod *params[1];
 	struct spa_pod_builder b;
 	uint32_t n_params;
 	uint8_t buffer[1024];
 	int res;
 	roc_protocol audio_proto, repair_proto;
+
+	if (pw_roc_spa_format_to_roc(audio_info->format, &subformat) < 0) {
+		pw_log_error("unsupported audio format: %d", audio_info->format);
+		return -EINVAL;
+	}
+
+	sample_size = pw_roc_spa_format_sample_size(audio_info->format);
+	data->stride = audio_info->channels * sample_size;
+
+	pw_log_info("receiver encoding: format=%d subformat=%d rate=%u channels=%u stride=%u",
+			audio_info->format, subformat, audio_info->rate,
+			audio_info->channels, data->stride);
 
 	spa_zero(context_config);
 	res = roc_context_open(&context_config, &data->context);
@@ -288,29 +305,47 @@ static int roc_source_setup(struct module_roc_source_data *data)
 		return -EINVAL;
 	}
 
+	roc_log_set_handler(pw_roc_log_handler, NULL);
+	roc_log_set_level(data->loglevel);
+
+	/* Register custom packet encoding so receiver can decode non-standard formats.
+	 * Both sender and receiver must register the same encoding ID with matching
+	 * parameters. Without this, only standard L16 stereo/mono at 44100Hz works. */
+	{
+		roc_media_encoding packet_enc;
+		spa_zero(packet_enc);
+		packet_enc.format = ROC_FORMAT_PCM;
+		packet_enc.subformat = subformat;
+		packet_enc.rate = audio_info->rate;
+		packet_enc.channels = pw_roc_channels_to_layout(audio_info->channels);
+		if (audio_info->channels > 2)
+			packet_enc.tracks = audio_info->channels;
+
+		res = roc_context_register_encoding(data->context,
+				PW_ROC_CUSTOM_ENCODING_ID, &packet_enc);
+		if (res) {
+			pw_log_error("failed to register custom packet encoding: %d", res);
+			return -EINVAL;
+		}
+		pw_log_info("registered custom packet encoding id=%d",
+				PW_ROC_CUSTOM_ENCODING_ID);
+	}
+
 	spa_zero(receiver_config);
 
-	receiver_config.frame_encoding.rate = data->rate;
-	receiver_config.frame_encoding.channels = ROC_CHANNEL_LAYOUT_STEREO;
-	receiver_config.frame_encoding.format = ROC_FORMAT_PCM_FLOAT32;
+	receiver_config.frame_encoding.format = ROC_FORMAT_PCM;
+	receiver_config.frame_encoding.subformat = subformat;
+	receiver_config.frame_encoding.rate = audio_info->rate;
+	receiver_config.frame_encoding.channels = pw_roc_channels_to_layout(audio_info->channels);
+	if (audio_info->channels > 2)
+		receiver_config.frame_encoding.tracks = audio_info->channels;
+
 	receiver_config.resampler_profile = data->resampler_profile;
 	receiver_config.resampler_backend = data->resampler_backend;
 	receiver_config.latency_tuner_backend = data->latency_tuner_backend;
 	receiver_config.latency_tuner_profile = data->latency_tuner_profile;
 
-	info.rate = data->rate;
-
-	/* Fixed to be the same as ROC receiver config above */
-	info.channels = 2;
-	info.format = SPA_AUDIO_FORMAT_F32;
-	info.position[0] = SPA_AUDIO_CHANNEL_FL;
-	info.position[1] = SPA_AUDIO_CHANNEL_FR;
-	data->stride = info.channels * sizeof(float);
-
-	pw_properties_setf(data->playback_props, PW_KEY_NODE_RATE, "1/%d", info.rate);
-
-    roc_log_set_handler(pw_roc_log_handler, NULL);
-    roc_log_set_level(data->loglevel);
+	pw_properties_setf(data->playback_props, PW_KEY_NODE_RATE, "1/%d", audio_info->rate);
 
 	/*
 	 * Note that target latency is in nano seconds.
@@ -384,7 +419,7 @@ static int roc_source_setup(struct module_roc_source_data *data)
 	n_params = 0;
 	spa_pod_builder_init(&b, buffer, sizeof(buffer));
 	params[n_params++] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
-			&info);
+			audio_info);
 
 	if ((res = pw_stream_connect(data->playback,
 			PW_DIRECTION_OUTPUT,
@@ -423,6 +458,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	struct pw_context *context = pw_impl_module_get_context(module);
 	struct module_roc_source_data *data;
 	struct pw_properties *playback_props = NULL;
+	struct spa_audio_info_raw audio_info = { 0 };
 	const char *str;
 	int res = 0;
 
@@ -469,7 +505,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	if (pw_properties_get(playback_props, PW_KEY_NODE_NETWORK) == NULL)
 		pw_properties_set(playback_props, PW_KEY_NODE_NETWORK, "true");
 
-	data->rate = pw_properties_get_uint32(playback_props, PW_KEY_AUDIO_RATE, 0);
+	pw_roc_parse_audio_info(playback_props, &audio_info);
+	data->rate = audio_info.rate;
 	if (data->rate == 0)
 		data->rate = PW_ROC_DEFAULT_RATE;
 
@@ -543,16 +580,16 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	} else {
 		data->fec_code = ROC_FEC_ENCODING_DEFAULT;
 	}
-    if ((str = pw_properties_get(props, "log.level")) != NULL) {
+	if ((str = pw_properties_get(props, "log.level")) != NULL) {
 		const struct spa_log *log_conf = pw_log_get();
 		roc_log_level default_level = ROC_LOG_ERROR;
-        if (log_conf) {
-        	default_level = pw_roc_log_level_pw_2_roc(log_conf->level);
+		if (log_conf) {
+			default_level = pw_roc_log_level_pw_2_roc(log_conf->level);
 		}
 		if (pw_roc_parse_log_level(&data->loglevel, str, default_level)) {
 			pw_log_error("Invalid log level %s, using default", str);
 			data->loglevel = default_level;
-        }
+		}
 	}
 
 	data->core = pw_context_get_object(data->module_context, PW_TYPE_INTERFACE_Core);
@@ -578,7 +615,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			&data->core_listener,
 			&core_events, data);
 
-	if ((res = roc_source_setup(data)) < 0)
+	if ((res = roc_source_setup(data, &audio_info)) < 0)
 		goto out;
 
 	pw_impl_module_add_listener(module, &data->module_listener, &module_events, data);

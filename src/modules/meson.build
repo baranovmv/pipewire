@@ -689,7 +689,8 @@ pipewire_module_vban_recv = shared_library('pipewire-module-vban-recv',
 build_module_roc = roc_dep.found()
 if build_module_roc
   pipewire_module_roc_sink = shared_library('pipewire-module-roc-sink',
-    [ 'module-roc-sink.c' ],
+    [ 'module-roc-sink.c',
+      'module-roc/common.c'],
     include_directories : [configinc],
     install : true,
     install_dir : modules_install_dir,
